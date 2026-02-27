@@ -11,6 +11,7 @@
 #include "hw/ppc/ppc.h"
 #include "exec/address-spaces.h"
 #include "exec/memory.h"
+#include "qemu/timer.h"
 #include "elf.h"
 
 #define SPC58_BOOT_FLASH_BASE  0x00fc0000u
@@ -45,6 +46,14 @@
 #define SPC58_SWT_BASE         0xfff38000u
 #define SPC58_SWT_SIZE         0x4000u
 
+#define SPC58_SWT_CR           0x0000u
+#define SPC58_SWT_IR           0x0004u
+#define SPC58_SWT_TO           0x0008u
+#define SPC58_SWT_CNT          0x000cu
+#define SPC58_SWT_SR           0x0010u
+
+#define SPC58_SWT_IRQ_ID       9u
+
 typedef struct SPC58EState {
     PowerPCCPU *cpu;
     MemoryRegion boot_flash;
@@ -62,9 +71,56 @@ typedef struct SPC58EState {
     uint8_t cgm_enabled;
     uint32_t cgm_core_hz;
     uint32_t cgm_periph_hz;
+    uint8_t swt_enabled;
+    uint32_t swt_reload;
+    uint32_t swt_counter;
+    uint32_t swt_service_step;
+    int64_t swt_last_ns;
 } SPC58EState;
 
 static SPC58EState spc58e;
+
+static void spc58e_intc_set_pending(SPC58EState *s, uint32_t irq);
+static void spc58e_intc_recompute_irq(SPC58EState *s);
+
+static void spc58e_swt_update_counter(SPC58EState *s)
+{
+    uint64_t elapsed_ns;
+    uint64_t ticks;
+    int64_t now;
+
+    if (!s->swt_enabled) {
+        s->swt_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->swt_last_ns == 0) {
+        s->swt_last_ns = now;
+        return;
+    }
+
+    if (now <= s->swt_last_ns) {
+        return;
+    }
+
+    elapsed_ns = (uint64_t)(now - s->swt_last_ns);
+    s->swt_last_ns = now;
+
+    /* lightweight model: watchdog runs from peripheral clock / 1024 */
+    ticks = (elapsed_ns * ((uint64_t)s->cgm_periph_hz / 1024u)) / NANOSECONDS_PER_SECOND;
+    if (ticks == 0) {
+        return;
+    }
+
+    if (ticks >= s->swt_counter) {
+        s->swt_counter = 0;
+        spc58e_intc_set_pending(s, SPC58_SWT_IRQ_ID);
+        spc58e_intc_recompute_irq(s);
+    } else {
+        s->swt_counter -= (uint32_t)ticks;
+    }
+}
 
 static void spc58e_cgm_recompute_clocks(SPC58EState *s)
 {
@@ -288,6 +344,22 @@ static uint64_t spc58e_swt_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t idx = addr >> 2;
     uint32_t value = (idx < ARRAY_SIZE(s->swt_regs)) ? s->swt_regs[idx] : 0;
 
+    spc58e_swt_update_counter(s);
+
+    switch (addr) {
+    case SPC58_SWT_CR:
+        value = s->swt_enabled ? 0x1u : 0x0u;
+        break;
+    case SPC58_SWT_TO:
+        value = s->swt_reload;
+        break;
+    case SPC58_SWT_CNT:
+        value = s->swt_counter;
+        break;
+    default:
+        break;
+    }
+
     qemu_log_mask(LOG_UNIMP,
                   "spc58e:swt rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
                   addr, size, value);
@@ -299,9 +371,42 @@ static void spc58e_swt_write(void *opaque, hwaddr addr, uint64_t data,
 {
     SPC58EState *s = opaque;
     uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    spc58e_swt_update_counter(s);
+
+    switch (addr) {
+    case SPC58_SWT_CR:
+        s->swt_enabled = (value & 0x1u) ? 1u : 0u;
+        if (s->swt_enabled && s->swt_counter == 0) {
+            s->swt_counter = s->swt_reload;
+        }
+        break;
+    case SPC58_SWT_TO:
+        s->swt_reload = value == 0 ? 1u : value;
+        if (!s->swt_enabled) {
+            s->swt_counter = s->swt_reload;
+        }
+        break;
+    case SPC58_SWT_SR:
+        /* service sequence: 0xA602 then 0xB480 */
+        if (s->swt_service_step == 0 && value == 0xA602u) {
+            s->swt_service_step = 1;
+        } else if (s->swt_service_step == 1 && value == 0xB480u) {
+            s->swt_counter = s->swt_reload;
+            s->swt_service_step = 0;
+            spc58e_intc_clear_pending(s, SPC58_SWT_IRQ_ID);
+            spc58e_intc_recompute_irq(s);
+        } else {
+            s->swt_service_step = 0;
+        }
+        break;
+    default:
+        break;
+    }
 
     if (idx < ARRAY_SIZE(s->swt_regs)) {
-        s->swt_regs[idx] = (uint32_t)data;
+        s->swt_regs[idx] = value;
     }
 
     qemu_log_mask(LOG_UNIMP,
@@ -406,6 +511,11 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.cgm_enabled = 1;
     spc58e.mc_cgm_regs[SPC58_MC_CGM_DIV >> 2] = 1;
     spc58e_cgm_recompute_clocks(&spc58e);
+    spc58e.swt_enabled = 1;
+    spc58e.swt_reload = 50000u;
+    spc58e.swt_counter = spc58e.swt_reload;
+    spc58e.swt_service_step = 0;
+    spc58e.swt_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     cpu_ppc_tb_init(env, 160000000UL);
 
