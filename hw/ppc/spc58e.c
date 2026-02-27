@@ -25,6 +25,16 @@
 #define SPC58_INTC_BASE        0xfff48000u
 #define SPC58_INTC_SIZE        0x4000u
 
+#define SPC58_INTC_MCR         0x0000u
+#define SPC58_INTC_CPR         0x0008u
+#define SPC58_INTC_IACKR       0x0010u
+#define SPC58_INTC_EOIR        0x0018u
+#define SPC58_INTC_TEST_SET    0x0100u
+#define SPC58_INTC_TEST_CLR    0x0104u
+
+#define SPC58_INTC_NUM_IRQS    256u
+#define SPC58_INTC_VEC_BASE    0x1000u
+
 #define SPC58_MC_CGM_BASE      0xfffec000u
 #define SPC58_MC_CGM_SIZE      0x4000u
 
@@ -32,6 +42,7 @@
 #define SPC58_SWT_SIZE         0x4000u
 
 typedef struct SPC58EState {
+    PowerPCCPU *cpu;
     MemoryRegion boot_flash;
     MemoryRegion sys_sram;
     MemoryRegion core2_sram;
@@ -39,17 +50,93 @@ typedef struct SPC58EState {
     MemoryRegion mc_cgm_mmio;
     MemoryRegion swt_mmio;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
+    uint32_t intc_pending[SPC58_INTC_NUM_IRQS / 32u];
     uint32_t mc_cgm_regs[SPC58_MC_CGM_SIZE / sizeof(uint32_t)];
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
+    uint8_t intc_enabled;
+    int32_t intc_current_irq;
 } SPC58EState;
 
 static SPC58EState spc58e;
 
+static bool spc58e_intc_is_pending(SPC58EState *s, uint32_t irq)
+{
+    uint32_t idx = irq >> 5;
+    uint32_t bit = irq & 31u;
+
+    return (s->intc_pending[idx] & (1u << bit)) != 0;
+}
+
+static void spc58e_intc_set_pending(SPC58EState *s, uint32_t irq)
+{
+    uint32_t idx = irq >> 5;
+    uint32_t bit = irq & 31u;
+
+    s->intc_pending[idx] |= (1u << bit);
+}
+
+static void spc58e_intc_clear_pending(SPC58EState *s, uint32_t irq)
+{
+    uint32_t idx = irq >> 5;
+    uint32_t bit = irq & 31u;
+
+    s->intc_pending[idx] &= ~(1u << bit);
+}
+
+static int32_t spc58e_intc_next_pending(SPC58EState *s)
+{
+    uint32_t irq;
+
+    for (irq = 0; irq < SPC58_INTC_NUM_IRQS; irq++) {
+        if (spc58e_intc_is_pending(s, irq)) {
+            return irq;
+        }
+    }
+
+    return -1;
+}
+
+static void spc58e_intc_recompute_irq(SPC58EState *s)
+{
+    int32_t next = spc58e_intc_next_pending(s);
+
+    if (!s->cpu) {
+        return;
+    }
+
+    if (s->intc_enabled && next >= 0) {
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 1);
+    } else {
+        ppc_set_irq(s->cpu, PPC_INTERRUPT_EXT, 0);
+    }
+}
+
 static uint64_t spc58e_intc_read(void *opaque, hwaddr addr, unsigned size)
 {
     SPC58EState *s = opaque;
+    int32_t irq;
+    uint32_t vec;
     uint32_t idx = addr >> 2;
     uint32_t value = (idx < ARRAY_SIZE(s->intc_regs)) ? s->intc_regs[idx] : 0;
+
+    switch (addr) {
+    case SPC58_INTC_MCR:
+        value = s->intc_enabled ? 0x0u : 0x1u;
+        break;
+    case SPC58_INTC_IACKR:
+        irq = spc58e_intc_next_pending(s);
+        if (irq >= 0) {
+            s->intc_current_irq = irq;
+            vec = SPC58_INTC_VEC_BASE + ((uint32_t)irq << 2);
+            value = vec;
+        } else {
+            s->intc_current_irq = -1;
+            value = 0;
+        }
+        break;
+    default:
+        break;
+    }
 
     qemu_log_mask(LOG_UNIMP,
                   "spc58e:intc rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
@@ -61,10 +148,38 @@ static void spc58e_intc_write(void *opaque, hwaddr addr, uint64_t data,
                               unsigned size)
 {
     SPC58EState *s = opaque;
+    uint32_t irq;
     uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    switch (addr) {
+    case SPC58_INTC_MCR:
+        s->intc_enabled = ((value & 0x1u) == 0u);
+        spc58e_intc_recompute_irq(s);
+        break;
+    case SPC58_INTC_EOIR:
+        if (s->intc_current_irq >= 0) {
+            spc58e_intc_clear_pending(s, (uint32_t)s->intc_current_irq);
+            s->intc_current_irq = -1;
+        }
+        spc58e_intc_recompute_irq(s);
+        break;
+    case SPC58_INTC_TEST_SET:
+        irq = value & 0xffu;
+        spc58e_intc_set_pending(s, irq);
+        spc58e_intc_recompute_irq(s);
+        break;
+    case SPC58_INTC_TEST_CLR:
+        irq = value & 0xffu;
+        spc58e_intc_clear_pending(s, irq);
+        spc58e_intc_recompute_irq(s);
+        break;
+    default:
+        break;
+    }
 
     if (idx < ARRAY_SIZE(s->intc_regs)) {
-        s->intc_regs[idx] = (uint32_t)data;
+        s->intc_regs[idx] = value;
     }
 
     qemu_log_mask(LOG_UNIMP,
@@ -236,6 +351,10 @@ static void spc58e_machine_init(MachineState *machine)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
     CPUPPCState *env = &cpu->env;
+
+    spc58e.cpu = cpu;
+    spc58e.intc_enabled = 1;
+    spc58e.intc_current_irq = -1;
 
     cpu_ppc_tb_init(env, 160000000UL);
 
