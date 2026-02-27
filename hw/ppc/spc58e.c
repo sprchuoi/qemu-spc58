@@ -38,6 +38,10 @@
 #define SPC58_MC_CGM_BASE      0xfffec000u
 #define SPC58_MC_CGM_SIZE      0x4000u
 
+#define SPC58_MC_CGM_CTRL      0x0000u
+#define SPC58_MC_CGM_STAT      0x0004u
+#define SPC58_MC_CGM_DIV       0x0030u
+
 #define SPC58_SWT_BASE         0xfff38000u
 #define SPC58_SWT_SIZE         0x4000u
 
@@ -55,9 +59,26 @@ typedef struct SPC58EState {
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
     uint8_t intc_enabled;
     int32_t intc_current_irq;
+    uint8_t cgm_enabled;
+    uint32_t cgm_core_hz;
+    uint32_t cgm_periph_hz;
 } SPC58EState;
 
 static SPC58EState spc58e;
+
+static void spc58e_cgm_recompute_clocks(SPC58EState *s)
+{
+    uint32_t div_raw = s->mc_cgm_regs[SPC58_MC_CGM_DIV >> 2] & 0x0fu;
+    uint32_t div = div_raw == 0 ? 1 : div_raw;
+
+    if (s->cgm_enabled) {
+        s->cgm_core_hz = 160000000u / div;
+        s->cgm_periph_hz = 80000000u / div;
+    } else {
+        s->cgm_core_hz = 16000000u;
+        s->cgm_periph_hz = 8000000u;
+    }
+}
 
 static bool spc58e_intc_is_pending(SPC58EState *s, uint32_t irq)
 {
@@ -203,6 +224,15 @@ static uint64_t spc58e_mc_cgm_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t idx = addr >> 2;
     uint32_t value = (idx < ARRAY_SIZE(s->mc_cgm_regs)) ? s->mc_cgm_regs[idx] : 0;
 
+    switch (addr) {
+    case SPC58_MC_CGM_STAT:
+        /* bit0: clock valid/locked (model) */
+        value = s->cgm_enabled ? 0x1u : 0x0u;
+        break;
+    default:
+        break;
+    }
+
     qemu_log_mask(LOG_UNIMP,
                   "spc58e:mc_cgm rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
                   addr, size, value);
@@ -214,10 +244,28 @@ static void spc58e_mc_cgm_write(void *opaque, hwaddr addr, uint64_t data,
 {
     SPC58EState *s = opaque;
     uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    switch (addr) {
+    case SPC58_MC_CGM_CTRL:
+        s->cgm_enabled = (value & 0x1u) ? 1u : 0u;
+        break;
+    case SPC58_MC_CGM_DIV:
+        /* keep a small divider range to avoid unrealistic values */
+        value &= 0x0fu;
+        if (value == 0) {
+            value = 1;
+        }
+        break;
+    default:
+        break;
+    }
 
     if (idx < ARRAY_SIZE(s->mc_cgm_regs)) {
-        s->mc_cgm_regs[idx] = (uint32_t)data;
+        s->mc_cgm_regs[idx] = value;
     }
+
+    spc58e_cgm_recompute_clocks(s);
 
     qemu_log_mask(LOG_UNIMP,
                   "spc58e:mc_cgm wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
@@ -355,6 +403,9 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.cpu = cpu;
     spc58e.intc_enabled = 1;
     spc58e.intc_current_irq = -1;
+    spc58e.cgm_enabled = 1;
+    spc58e.mc_cgm_regs[SPC58_MC_CGM_DIV >> 2] = 1;
+    spc58e_cgm_recompute_clocks(&spc58e);
 
     cpu_ppc_tb_init(env, 160000000UL);
 
@@ -367,6 +418,7 @@ static void spc58e_machine_init(MachineState *machine)
     error_report("spc58e: intc  @0x%08x size=0x%x", SPC58_INTC_BASE, SPC58_INTC_SIZE);
     error_report("spc58e: cgm   @0x%08x size=0x%x", SPC58_MC_CGM_BASE, SPC58_MC_CGM_SIZE);
     error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
+    error_report("spc58e: clock core=%uHz periph=%uHz", spc58e.cgm_core_hz, spc58e.cgm_periph_hz);
 }
 
 static void spc58e_machine_class_init(ObjectClass *oc, void *data)
