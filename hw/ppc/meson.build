@@ -86,6 +86,8 @@ ppc_ss.add(when: 'CONFIG_VIRTEX', if_true: files('virtex_ml507.c'))
 ppc_ss.add(when: 'CONFIG_AMIGAONE', if_true: files('amigaone.c'))
 # Pegasos2
 ppc_ss.add(when: 'CONFIG_PEGASOS2', if_true: files('pegasos2.c'))
+# SPC58E
+ppc_ss.add(when: 'CONFIG_SPC58E_MACHINE', if_true: files('spc58e.c'))
 
 ppc_ss.add(when: 'CONFIG_VOF', if_true: files('vof.c'))
 ppc_ss.add(when: ['CONFIG_VOF', 'CONFIG_PSERIES'], if_true: files('spapr_vof.c'))

@@ -167,3 +167,8 @@ config FDT_PPC
 
 config VOF
     bool
+
+config SPC58E_MACHINE
+    bool
+    default y
+    depends on PPC
