@@ -53,6 +53,28 @@
 #define SPC58_FLASHC_AR        0x0010u
 #define SPC58_FLASHC_CMD       0x0014u
 
+#define SPC58_PIT_BASE         0xfff84000u
+#define SPC58_PIT_SIZE         0x4000u
+
+#define SPC58_PIT_CH_BASE      0x0100u
+#define SPC58_PIT_CH_STRIDE    0x0010u
+#define SPC58_PIT_LDVAL_OFF    0x0000u
+#define SPC58_PIT_CVAL_OFF     0x0004u
+#define SPC58_PIT_TCTRL_OFF    0x0008u
+#define SPC58_PIT_TFLG_OFF     0x000cu
+
+#define SPC58_STM_BASE         0xfff7c000u
+#define SPC58_STM_SIZE         0x4000u
+
+#define SPC58_STM_CNT          0x0000u
+#define SPC58_STM_CMP0         0x0010u
+#define SPC58_STM_CR           0x0020u
+#define SPC58_STM_SR           0x0024u
+
+#define SPC58_PIT_NUM_CH       4u
+#define SPC58_PIT_IRQ_BASE     32u
+#define SPC58_STM_IRQ_ID       48u
+
 #define SPC58_SWT_BASE         0xfff38000u
 #define SPC58_SWT_SIZE         0x4000u
 
@@ -72,11 +94,15 @@ typedef struct SPC58EState {
     MemoryRegion intc_mmio;
     MemoryRegion mc_cgm_mmio;
     MemoryRegion flashc_mmio;
+    MemoryRegion pit_mmio;
+    MemoryRegion stm_mmio;
     MemoryRegion swt_mmio;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
     uint32_t intc_pending[SPC58_INTC_NUM_IRQS / 32u];
     uint32_t mc_cgm_regs[SPC58_MC_CGM_SIZE / sizeof(uint32_t)];
     uint32_t flashc_regs[SPC58_FLASHC_SIZE / sizeof(uint32_t)];
+    uint32_t pit_regs[SPC58_PIT_SIZE / sizeof(uint32_t)];
+    uint32_t stm_regs[SPC58_STM_SIZE / sizeof(uint32_t)];
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
     uint8_t intc_enabled;
     int32_t intc_current_irq;
@@ -89,6 +115,8 @@ typedef struct SPC58EState {
     uint32_t swt_service_step;
     int64_t swt_last_ns;
     uint8_t flashc_busy;
+    int64_t pit_last_ns;
+    int64_t stm_last_ns;
 } SPC58EState;
 
 static SPC58EState spc58e;
@@ -132,6 +160,96 @@ static void spc58e_swt_update_counter(SPC58EState *s)
         spc58e_intc_recompute_irq(s);
     } else {
         s->swt_counter -= (uint32_t)ticks;
+    }
+}
+
+static void spc58e_pit_update(SPC58EState *s)
+{
+    uint64_t elapsed_ns;
+    uint64_t ticks;
+    int64_t now;
+    uint32_t ch;
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->pit_last_ns == 0) {
+        s->pit_last_ns = now;
+        return;
+    }
+
+    if (now <= s->pit_last_ns) {
+        return;
+    }
+
+    elapsed_ns = (uint64_t)(now - s->pit_last_ns);
+    s->pit_last_ns = now;
+    ticks = (elapsed_ns * ((uint64_t)s->cgm_periph_hz / 64u)) / NANOSECONDS_PER_SECOND;
+    if (ticks == 0) {
+        return;
+    }
+
+    for (ch = 0; ch < SPC58_PIT_NUM_CH; ch++) {
+        uint32_t base = (SPC58_PIT_CH_BASE + ch * SPC58_PIT_CH_STRIDE) >> 2;
+        uint32_t ldval = s->pit_regs[base + (SPC58_PIT_LDVAL_OFF >> 2)];
+        uint32_t cval = s->pit_regs[base + (SPC58_PIT_CVAL_OFF >> 2)];
+        uint32_t tctrl = s->pit_regs[base + (SPC58_PIT_TCTRL_OFF >> 2)];
+        uint32_t tflg = s->pit_regs[base + (SPC58_PIT_TFLG_OFF >> 2)];
+
+        if ((tctrl & 0x1u) == 0u) {
+            continue;
+        }
+
+        if (ticks >= cval) {
+            s->pit_regs[base + (SPC58_PIT_CVAL_OFF >> 2)] = ldval;
+            tflg |= 0x1u;
+            s->pit_regs[base + (SPC58_PIT_TFLG_OFF >> 2)] = tflg;
+
+            if (tctrl & 0x2u) {
+                spc58e_intc_set_pending(s, SPC58_PIT_IRQ_BASE + ch);
+            }
+        } else {
+            s->pit_regs[base + (SPC58_PIT_CVAL_OFF >> 2)] = cval - (uint32_t)ticks;
+        }
+    }
+
+    spc58e_intc_recompute_irq(s);
+}
+
+static void spc58e_stm_update(SPC58EState *s)
+{
+    uint64_t elapsed_ns;
+    uint64_t ticks;
+    uint32_t cnt;
+    uint32_t cmp0;
+    uint32_t cr;
+    int64_t now;
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->stm_last_ns == 0) {
+        s->stm_last_ns = now;
+        return;
+    }
+
+    if (now <= s->stm_last_ns) {
+        return;
+    }
+
+    elapsed_ns = (uint64_t)(now - s->stm_last_ns);
+    s->stm_last_ns = now;
+    ticks = (elapsed_ns * ((uint64_t)s->cgm_periph_hz / 128u)) / NANOSECONDS_PER_SECOND;
+    if (ticks == 0) {
+        return;
+    }
+
+    cnt = s->stm_regs[SPC58_STM_CNT >> 2];
+    cmp0 = s->stm_regs[SPC58_STM_CMP0 >> 2];
+    cr = s->stm_regs[SPC58_STM_CR >> 2];
+    cnt += (uint32_t)ticks;
+    s->stm_regs[SPC58_STM_CNT >> 2] = cnt;
+
+    if ((cr & 0x1u) && cnt >= cmp0) {
+        s->stm_regs[SPC58_STM_SR >> 2] |= 0x1u;
+        spc58e_intc_set_pending(s, SPC58_STM_IRQ_ID);
+        spc58e_intc_recompute_irq(s);
     }
 }
 
@@ -408,6 +526,100 @@ static const MemoryRegionOps spc58e_flashc_ops = {
     },
 };
 
+static uint64_t spc58e_pit_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->pit_regs)) ? s->pit_regs[idx] : 0;
+
+    spc58e_pit_update(s);
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:pit rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_pit_write(void *opaque, hwaddr addr, uint64_t data,
+                             unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    spc58e_pit_update(s);
+    if (idx < ARRAY_SIZE(s->pit_regs)) {
+        s->pit_regs[idx] = value;
+    }
+
+    if ((addr & (SPC58_PIT_CH_STRIDE - 1u)) == SPC58_PIT_TFLG_OFF && (value & 0x1u)) {
+        uint32_t ch = (addr - SPC58_PIT_CH_BASE) / SPC58_PIT_CH_STRIDE;
+        if (ch < SPC58_PIT_NUM_CH) {
+            spc58e_intc_clear_pending(s, SPC58_PIT_IRQ_BASE + ch);
+            spc58e_intc_recompute_irq(s);
+        }
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:pit wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_pit_ops = {
+    .read = spc58e_pit_read,
+    .write = spc58e_pit_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t spc58e_stm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->stm_regs)) ? s->stm_regs[idx] : 0;
+
+    spc58e_stm_update(s);
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:stm rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_stm_write(void *opaque, hwaddr addr, uint64_t data,
+                             unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    spc58e_stm_update(s);
+    if (idx < ARRAY_SIZE(s->stm_regs)) {
+        s->stm_regs[idx] = value;
+    }
+
+    if (addr == SPC58_STM_SR && (value & 0x1u)) {
+        s->stm_regs[SPC58_STM_SR >> 2] &= ~0x1u;
+        spc58e_intc_clear_pending(s, SPC58_STM_IRQ_ID);
+        spc58e_intc_recompute_irq(s);
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:stm wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_stm_ops = {
+    .read = spc58e_stm_read,
+    .write = spc58e_stm_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t spc58e_swt_read(void *opaque, hwaddr addr, unsigned size)
 {
     SPC58EState *s = opaque;
@@ -527,6 +739,14 @@ static void spc58e_map_memories(void)
                           "spc58e.flashc", SPC58_FLASHC_SIZE);
     memory_region_add_subregion(sysmem, SPC58_FLASHC_BASE, &spc58e.flashc_mmio);
 
+    memory_region_init_io(&spc58e.pit_mmio, NULL, &spc58e_pit_ops, &spc58e,
+                          "spc58e.pit", SPC58_PIT_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_PIT_BASE, &spc58e.pit_mmio);
+
+    memory_region_init_io(&spc58e.stm_mmio, NULL, &spc58e_stm_ops, &spc58e,
+                          "spc58e.stm", SPC58_STM_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_STM_BASE, &spc58e.stm_mmio);
+
     memory_region_init_io(&spc58e.swt_mmio, NULL, &spc58e_swt_ops, &spc58e,
                           "spc58e.swt", SPC58_SWT_SIZE);
     memory_region_add_subregion(sysmem, SPC58_SWT_BASE, &spc58e.swt_mmio);
@@ -591,6 +811,9 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.swt_service_step = 0;
     spc58e.swt_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     spc58e.flashc_busy = 0;
+    spc58e.pit_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    spc58e.stm_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    spc58e.stm_regs[SPC58_STM_CMP0 >> 2] = 10000u;
 
     cpu_ppc_tb_init(env, 160000000UL);
 
@@ -603,6 +826,8 @@ static void spc58e_machine_init(MachineState *machine)
     error_report("spc58e: intc  @0x%08x size=0x%x", SPC58_INTC_BASE, SPC58_INTC_SIZE);
     error_report("spc58e: cgm   @0x%08x size=0x%x", SPC58_MC_CGM_BASE, SPC58_MC_CGM_SIZE);
     error_report("spc58e: flash @0x%08x size=0x%x", SPC58_FLASHC_BASE, SPC58_FLASHC_SIZE);
+    error_report("spc58e: pit   @0x%08x size=0x%x", SPC58_PIT_BASE, SPC58_PIT_SIZE);
+    error_report("spc58e: stm   @0x%08x size=0x%x", SPC58_STM_BASE, SPC58_STM_SIZE);
     error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
     error_report("spc58e: clock core=%uHz periph=%uHz", spc58e.cgm_core_hz, spc58e.cgm_periph_hz);
 }
