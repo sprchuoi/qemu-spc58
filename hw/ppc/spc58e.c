@@ -75,6 +75,19 @@
 #define SPC58_PIT_IRQ_BASE     32u
 #define SPC58_STM_IRQ_ID       48u
 
+#define SPC58_VALID_BASE        0xfffe8000u
+#define SPC58_VALID_SIZE        0x1000u
+
+#define SPC58_VALID_SIGNATURE   0x0000u
+#define SPC58_VALID_FLAGS       0x0004u
+#define SPC58_VALID_ENTRY_LO    0x0008u
+#define SPC58_VALID_LAST_IRQ    0x000cu
+#define SPC58_VALID_IRQ_COUNT   0x0010u
+#define SPC58_VALID_WDG_TRIPS   0x0014u
+#define SPC58_VALID_LAST_EVENT  0x0018u
+
+#define SPC58_VALID_MAGIC       0x53504335u /* 'SPC5' */
+
 #define SPC58_SWT_BASE         0xfff38000u
 #define SPC58_SWT_SIZE         0x4000u
 
@@ -96,6 +109,7 @@ typedef struct SPC58EState {
     MemoryRegion flashc_mmio;
     MemoryRegion pit_mmio;
     MemoryRegion stm_mmio;
+    MemoryRegion valid_mmio;
     MemoryRegion swt_mmio;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
     uint32_t intc_pending[SPC58_INTC_NUM_IRQS / 32u];
@@ -103,6 +117,7 @@ typedef struct SPC58EState {
     uint32_t flashc_regs[SPC58_FLASHC_SIZE / sizeof(uint32_t)];
     uint32_t pit_regs[SPC58_PIT_SIZE / sizeof(uint32_t)];
     uint32_t stm_regs[SPC58_STM_SIZE / sizeof(uint32_t)];
+    uint32_t valid_regs[SPC58_VALID_SIZE / sizeof(uint32_t)];
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
     uint8_t intc_enabled;
     int32_t intc_current_irq;
@@ -158,6 +173,8 @@ static void spc58e_swt_update_counter(SPC58EState *s)
         s->swt_counter = 0;
         spc58e_intc_set_pending(s, SPC58_SWT_IRQ_ID);
         spc58e_intc_recompute_irq(s);
+        s->valid_regs[SPC58_VALID_WDG_TRIPS >> 2]++;
+        s->valid_regs[SPC58_VALID_LAST_EVENT >> 2] = 0x57444730u; /* WDG0 */
     } else {
         s->swt_counter -= (uint32_t)ticks;
     }
@@ -337,6 +354,9 @@ static uint64_t spc58e_intc_read(void *opaque, hwaddr addr, unsigned size)
             s->intc_current_irq = irq;
             vec = SPC58_INTC_VEC_BASE + ((uint32_t)irq << 2);
             value = vec;
+            s->valid_regs[SPC58_VALID_LAST_IRQ >> 2] = (uint32_t)irq;
+            s->valid_regs[SPC58_VALID_IRQ_COUNT >> 2]++;
+            s->valid_regs[SPC58_VALID_LAST_EVENT >> 2] = 0x49525141u; /* IRQA */
         } else {
             s->intc_current_irq = -1;
             value = 0;
@@ -369,6 +389,7 @@ static void spc58e_intc_write(void *opaque, hwaddr addr, uint64_t data,
         if (s->intc_current_irq >= 0) {
             spc58e_intc_clear_pending(s, (uint32_t)s->intc_current_irq);
             s->intc_current_irq = -1;
+            s->valid_regs[SPC58_VALID_LAST_EVENT >> 2] = 0x49525145u; /* IRQE */
         }
         spc58e_intc_recompute_irq(s);
         break;
@@ -620,6 +641,44 @@ static const MemoryRegionOps spc58e_stm_ops = {
     },
 };
 
+static uint64_t spc58e_valid_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->valid_regs)) ? s->valid_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:valid rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_valid_write(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    if (idx < ARRAY_SIZE(s->valid_regs)) {
+        s->valid_regs[idx] = value;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:valid wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_valid_ops = {
+    .read = spc58e_valid_read,
+    .write = spc58e_valid_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t spc58e_swt_read(void *opaque, hwaddr addr, unsigned size)
 {
     SPC58EState *s = opaque;
@@ -747,6 +806,10 @@ static void spc58e_map_memories(void)
                           "spc58e.stm", SPC58_STM_SIZE);
     memory_region_add_subregion(sysmem, SPC58_STM_BASE, &spc58e.stm_mmio);
 
+    memory_region_init_io(&spc58e.valid_mmio, NULL, &spc58e_valid_ops, &spc58e,
+                          "spc58e.valid", SPC58_VALID_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_VALID_BASE, &spc58e.valid_mmio);
+
     memory_region_init_io(&spc58e.swt_mmio, NULL, &spc58e_swt_ops, &spc58e,
                           "spc58e.swt", SPC58_SWT_SIZE);
     memory_region_add_subregion(sysmem, SPC58_SWT_BASE, &spc58e.swt_mmio);
@@ -792,6 +855,9 @@ static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
 
     env->nip = entry;
     error_report("spc58e: entry=0x%" PRIx64, entry);
+    spc58e.valid_regs[SPC58_VALID_ENTRY_LO >> 2] = (uint32_t)entry;
+    spc58e.valid_regs[SPC58_VALID_FLAGS >> 2] |= 0x1u; /* entry loaded */
+    spc58e.valid_regs[SPC58_VALID_LAST_EVENT >> 2] = 0x454e5452u; /* ENTR */
 }
 
 static void spc58e_machine_init(MachineState *machine)
@@ -814,6 +880,9 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.pit_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     spc58e.stm_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     spc58e.stm_regs[SPC58_STM_CMP0 >> 2] = 10000u;
+    spc58e.valid_regs[SPC58_VALID_SIGNATURE >> 2] = SPC58_VALID_MAGIC;
+    spc58e.valid_regs[SPC58_VALID_FLAGS >> 2] = 0x0u;
+    spc58e.valid_regs[SPC58_VALID_LAST_EVENT >> 2] = 0x424f4f54u; /* BOOT */
 
     cpu_ppc_tb_init(env, 160000000UL);
 
@@ -828,6 +897,7 @@ static void spc58e_machine_init(MachineState *machine)
     error_report("spc58e: flash @0x%08x size=0x%x", SPC58_FLASHC_BASE, SPC58_FLASHC_SIZE);
     error_report("spc58e: pit   @0x%08x size=0x%x", SPC58_PIT_BASE, SPC58_PIT_SIZE);
     error_report("spc58e: stm   @0x%08x size=0x%x", SPC58_STM_BASE, SPC58_STM_SIZE);
+    error_report("spc58e: valid @0x%08x size=0x%x", SPC58_VALID_BASE, SPC58_VALID_SIZE);
     error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
     error_report("spc58e: clock core=%uHz periph=%uHz", spc58e.cgm_core_hz, spc58e.cgm_periph_hz);
 }
