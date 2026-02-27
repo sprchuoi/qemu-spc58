@@ -43,6 +43,16 @@
 #define SPC58_MC_CGM_STAT      0x0004u
 #define SPC58_MC_CGM_DIV       0x0030u
 
+#define SPC58_FLASHC_BASE      0xfff44000u
+#define SPC58_FLASHC_SIZE      0x4000u
+
+#define SPC58_FLASHC_MCR       0x0000u
+#define SPC58_FLASHC_MCRS      0x0004u
+#define SPC58_FLASHC_LMLR      0x0008u
+#define SPC58_FLASHC_HLR       0x000cu
+#define SPC58_FLASHC_AR        0x0010u
+#define SPC58_FLASHC_CMD       0x0014u
+
 #define SPC58_SWT_BASE         0xfff38000u
 #define SPC58_SWT_SIZE         0x4000u
 
@@ -61,10 +71,12 @@ typedef struct SPC58EState {
     MemoryRegion core2_sram;
     MemoryRegion intc_mmio;
     MemoryRegion mc_cgm_mmio;
+    MemoryRegion flashc_mmio;
     MemoryRegion swt_mmio;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
     uint32_t intc_pending[SPC58_INTC_NUM_IRQS / 32u];
     uint32_t mc_cgm_regs[SPC58_MC_CGM_SIZE / sizeof(uint32_t)];
+    uint32_t flashc_regs[SPC58_FLASHC_SIZE / sizeof(uint32_t)];
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
     uint8_t intc_enabled;
     int32_t intc_current_irq;
@@ -76,6 +88,7 @@ typedef struct SPC58EState {
     uint32_t swt_counter;
     uint32_t swt_service_step;
     int64_t swt_last_ns;
+    uint8_t flashc_busy;
 } SPC58EState;
 
 static SPC58EState spc58e;
@@ -338,6 +351,63 @@ static const MemoryRegionOps spc58e_mc_cgm_ops = {
     },
 };
 
+static uint64_t spc58e_flashc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->flashc_regs)) ? s->flashc_regs[idx] : 0;
+
+    switch (addr) {
+    case SPC58_FLASHC_MCRS:
+        /* bit0: DONE, bit1: PGM/erase busy */
+        value = s->flashc_busy ? 0x2u : 0x1u;
+        break;
+    default:
+        break;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:flashc rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_flashc_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    switch (addr) {
+    case SPC58_FLASHC_CMD:
+        /* model command execution as immediate completion */
+        s->flashc_busy = 1;
+        s->flashc_busy = 0;
+        break;
+    default:
+        break;
+    }
+
+    if (idx < ARRAY_SIZE(s->flashc_regs)) {
+        s->flashc_regs[idx] = value;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:flashc wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_flashc_ops = {
+    .read = spc58e_flashc_read,
+    .write = spc58e_flashc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t spc58e_swt_read(void *opaque, hwaddr addr, unsigned size)
 {
     SPC58EState *s = opaque;
@@ -453,6 +523,10 @@ static void spc58e_map_memories(void)
                           "spc58e.mc_cgm", SPC58_MC_CGM_SIZE);
     memory_region_add_subregion(sysmem, SPC58_MC_CGM_BASE, &spc58e.mc_cgm_mmio);
 
+    memory_region_init_io(&spc58e.flashc_mmio, NULL, &spc58e_flashc_ops, &spc58e,
+                          "spc58e.flashc", SPC58_FLASHC_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_FLASHC_BASE, &spc58e.flashc_mmio);
+
     memory_region_init_io(&spc58e.swt_mmio, NULL, &spc58e_swt_ops, &spc58e,
                           "spc58e.swt", SPC58_SWT_SIZE);
     memory_region_add_subregion(sysmem, SPC58_SWT_BASE, &spc58e.swt_mmio);
@@ -516,6 +590,7 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.swt_counter = spc58e.swt_reload;
     spc58e.swt_service_step = 0;
     spc58e.swt_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    spc58e.flashc_busy = 0;
 
     cpu_ppc_tb_init(env, 160000000UL);
 
@@ -527,6 +602,7 @@ static void spc58e_machine_init(MachineState *machine)
     error_report("spc58e: c2ram @0x%08x size=0x%x", SPC58_CORE2_SRAM_BASE, SPC58_CORE2_SRAM_SIZE);
     error_report("spc58e: intc  @0x%08x size=0x%x", SPC58_INTC_BASE, SPC58_INTC_SIZE);
     error_report("spc58e: cgm   @0x%08x size=0x%x", SPC58_MC_CGM_BASE, SPC58_MC_CGM_SIZE);
+    error_report("spc58e: flash @0x%08x size=0x%x", SPC58_FLASHC_BASE, SPC58_FLASHC_SIZE);
     error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
     error_report("spc58e: clock core=%uHz periph=%uHz", spc58e.cgm_core_hz, spc58e.cgm_periph_hz);
 }
