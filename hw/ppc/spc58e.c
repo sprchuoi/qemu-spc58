@@ -25,12 +25,22 @@
 #define SPC58_INTC_BASE        0xfff48000u
 #define SPC58_INTC_SIZE        0x4000u
 
+#define SPC58_MC_CGM_BASE      0xfffec000u
+#define SPC58_MC_CGM_SIZE      0x4000u
+
+#define SPC58_SWT_BASE         0xfff38000u
+#define SPC58_SWT_SIZE         0x4000u
+
 typedef struct SPC58EState {
     MemoryRegion boot_flash;
     MemoryRegion sys_sram;
     MemoryRegion core2_sram;
     MemoryRegion intc_mmio;
+    MemoryRegion mc_cgm_mmio;
+    MemoryRegion swt_mmio;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
+    uint32_t mc_cgm_regs[SPC58_MC_CGM_SIZE / sizeof(uint32_t)];
+    uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
 } SPC58EState;
 
 static SPC58EState spc58e;
@@ -72,6 +82,80 @@ static const MemoryRegionOps spc58e_intc_ops = {
     },
 };
 
+static uint64_t spc58e_mc_cgm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->mc_cgm_regs)) ? s->mc_cgm_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_cgm rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_mc_cgm_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+
+    if (idx < ARRAY_SIZE(s->mc_cgm_regs)) {
+        s->mc_cgm_regs[idx] = (uint32_t)data;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_cgm wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_mc_cgm_ops = {
+    .read = spc58e_mc_cgm_read,
+    .write = spc58e_mc_cgm_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t spc58e_swt_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->swt_regs)) ? s->swt_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:swt rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_swt_write(void *opaque, hwaddr addr, uint64_t data,
+                             unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+
+    if (idx < ARRAY_SIZE(s->swt_regs)) {
+        s->swt_regs[idx] = (uint32_t)data;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:swt wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_swt_ops = {
+    .read = spc58e_swt_read,
+    .write = spc58e_swt_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t spc58e_translate_elf(void *opaque, uint64_t addr)
 {
     return addr;
@@ -96,6 +180,14 @@ static void spc58e_map_memories(void)
     memory_region_init_io(&spc58e.intc_mmio, NULL, &spc58e_intc_ops, &spc58e,
                           "spc58e.intc", SPC58_INTC_SIZE);
     memory_region_add_subregion(sysmem, SPC58_INTC_BASE, &spc58e.intc_mmio);
+
+    memory_region_init_io(&spc58e.mc_cgm_mmio, NULL, &spc58e_mc_cgm_ops, &spc58e,
+                          "spc58e.mc_cgm", SPC58_MC_CGM_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_MC_CGM_BASE, &spc58e.mc_cgm_mmio);
+
+    memory_region_init_io(&spc58e.swt_mmio, NULL, &spc58e_swt_ops, &spc58e,
+                          "spc58e.swt", SPC58_SWT_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_SWT_BASE, &spc58e.swt_mmio);
 }
 
 static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
@@ -154,6 +246,8 @@ static void spc58e_machine_init(MachineState *machine)
     error_report("spc58e: sys   @0x%08x size=0x%x", SPC58_SYS_SRAM_BASE, SPC58_SYS_SRAM_SIZE);
     error_report("spc58e: c2ram @0x%08x size=0x%x", SPC58_CORE2_SRAM_BASE, SPC58_CORE2_SRAM_SIZE);
     error_report("spc58e: intc  @0x%08x size=0x%x", SPC58_INTC_BASE, SPC58_INTC_SIZE);
+    error_report("spc58e: cgm   @0x%08x size=0x%x", SPC58_MC_CGM_BASE, SPC58_MC_CGM_SIZE);
+    error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
 }
 
 static void spc58e_machine_class_init(ObjectClass *oc, void *data)
