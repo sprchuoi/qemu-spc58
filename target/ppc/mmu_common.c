@@ -1552,8 +1552,19 @@ bool ppc_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 hwaddr ppc_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
+    CPUPPCState *env = &cpu->env;
     hwaddr raddr;
     int s, p;
+
+    /*
+     * Real mode (MSR[IR]=0 and MSR[DR]=0): no address translation,
+     * virtual address == physical address.  BOOKE206 has no real-mode
+     * bypass in its TLB lookup path, so handle it here explicitly so
+     * that GDB can access memory before firmware sets up TLB entries.
+     */
+    if (!FIELD_EX64(env->msr, MSR, IR) && !FIELD_EX64(env->msr, MSR, DR)) {
+        return addr & TARGET_PAGE_MASK;
+    }
 
     /*
      * Some MMUs have separate TLBs for code and data. If we only
@@ -1561,9 +1572,9 @@ hwaddr ppc_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
      * mapped by code TLBs, so we also try a MMU_INST_FETCH.
      */
     if (ppc_xlate(cpu, addr, MMU_DATA_LOAD, &raddr, &s, &p,
-                  cpu_mmu_index(&cpu->env, false), false) ||
+                  cpu_mmu_index(env, false), false) ||
         ppc_xlate(cpu, addr, MMU_INST_FETCH, &raddr, &s, &p,
-                  cpu_mmu_index(&cpu->env, true), false)) {
+                  cpu_mmu_index(env, true), false)) {
         return raddr & TARGET_PAGE_MASK;
     }
     return -1;

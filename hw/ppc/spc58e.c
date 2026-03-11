@@ -6,13 +6,16 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
-#include "hw/core/boards.h"
-#include "hw/core/loader.h"
+#include "hw/boards.h"
+#include "hw/loader.h"
 #include "hw/ppc/ppc.h"
 #include "exec/address-spaces.h"
 #include "exec/memory.h"
+#include "exec/cpu-common.h"
 #include "qemu/timer.h"
 #include "elf.h"
+#include "qapi/error.h"
+#include "target/ppc/cpu.h"
 
 #define SPC58_BOOT_FLASH_BASE  0x00fc0000u
 #define SPC58_BOOT_FLASH_SIZE  (256 * KiB)
@@ -765,9 +768,94 @@ static const MemoryRegionOps spc58e_swt_ops = {
     },
 };
 
-static uint64_t spc58e_translate_elf(void *opaque, uint64_t addr)
+/*
+ * Custom ELF loader: loads PT_LOAD segments at their VirtAddr (p_vaddr).
+ *
+ * The Honda MasterMcu_Fbl.elf has all PhysAddr=0x0 but correct VirtAddr
+ * (e.g. 0xfc0000 for flash). QEMU's load_elf() uses PhysAddr, so we must
+ * parse the segments ourselves.
+ *
+ * Returns the ELF entry point on success, 0 on failure.
+ */
+static uint64_t spc58e_load_elf_vma(const char *filename)
 {
-    return addr;
+    int fd;
+    Elf32_Ehdr ehdr;
+    Elf32_Phdr *phdrs = NULL;
+    uint8_t *seg_data = NULL;
+    uint64_t entry = 0;
+    int i;
+
+    fd = open(filename, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        error_report("spc58e: cannot open '%s': %s", filename, strerror(errno));
+        return 0;
+    }
+
+    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+        error_report("spc58e: failed to read ELF header");
+        goto out;
+    }
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        error_report("spc58e: not an ELF file");
+        goto out;
+    }
+
+    /* Convert from big-endian (PowerPC) */
+    bswap32s(&ehdr.e_entry);
+    bswap32s((uint32_t *)&ehdr.e_phoff);
+    bswap16s(&ehdr.e_phentsize);
+    bswap16s(&ehdr.e_phnum);
+
+    entry = ehdr.e_entry;
+
+    size_t phdr_sz = (size_t)ehdr.e_phentsize * ehdr.e_phnum;
+    phdrs = g_malloc(phdr_sz);
+
+    if (lseek(fd, ehdr.e_phoff, SEEK_SET) < 0 ||
+        read(fd, phdrs, phdr_sz) != (ssize_t)phdr_sz) {
+        error_report("spc58e: failed to read program headers");
+        entry = 0;
+        goto out;
+    }
+
+    for (i = 0; i < ehdr.e_phnum; i++) {
+        Elf32_Phdr *ph = &phdrs[i];
+        bswap32s(&ph->p_type);
+        bswap32s(&ph->p_offset);
+        bswap32s(&ph->p_vaddr);
+        bswap32s(&ph->p_paddr);
+        bswap32s(&ph->p_filesz);
+        bswap32s(&ph->p_memsz);
+        bswap32s(&ph->p_flags);
+        bswap32s(&ph->p_align);
+
+        if (ph->p_type != PT_LOAD || ph->p_filesz == 0) {
+            continue;
+        }
+
+        seg_data = g_malloc(ph->p_filesz);
+        if (lseek(fd, ph->p_offset, SEEK_SET) < 0 ||
+            read(fd, seg_data, ph->p_filesz) != (ssize_t)ph->p_filesz) {
+            error_report("spc58e: failed to read segment %d", i);
+            g_free(seg_data);
+            seg_data = NULL;
+            entry = 0;
+            goto out;
+        }
+
+        cpu_physical_memory_write(ph->p_vaddr, seg_data, ph->p_filesz);
+        error_report("spc58e: seg[%d] vaddr=0x%08x size=0x%x loaded", i,
+                     ph->p_vaddr, ph->p_filesz);
+
+        g_free(seg_data);
+        seg_data = NULL;
+    }
+
+out:
+    g_free(phdrs);
+    close(fd);
+    return entry;
 }
 
 static void spc58e_map_memories(void)
@@ -818,26 +906,19 @@ static void spc58e_map_memories(void)
 static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
 {
     uint64_t entry = 0;
-    uint64_t low = 0;
-    uint64_t high = 0;
 
     if (!machine->kernel_filename) {
         error_report("spc58e: no firmware provided, use -kernel <MasterMcu_Fbl.elf>");
         return;
     }
 
-    if (load_elf(machine->kernel_filename,
-                 NULL,
-                 spc58e_translate_elf,
-                 NULL,
-                 &entry,
-                 &low,
-                 &high,
-                 NULL,
-                 ELFDATA2MSB,
-                 PPC_ELF_MACHINE,
-                 0,
-                 0) < 0) {
+    /*
+     * Honda MasterMcu_Fbl.elf has all PhysAddr=0x0 but correct VirtAddr.
+     * Use custom VMA-based loader instead of load_elf() which uses PhysAddr.
+     */
+    entry = spc58e_load_elf_vma(machine->kernel_filename);
+    if (!entry) {
+        /* Fallback: try raw binary at flash base */
         hwaddr raw = load_image_targphys(machine->kernel_filename,
                                          SPC58_BOOT_FLASH_BASE,
                                          SPC58_BOOT_FLASH_SIZE);
@@ -848,9 +929,6 @@ static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
         entry = SPC58_BOOT_FLASH_BASE;
         error_report("spc58e: raw image loaded at 0x%08x (%" PRIu64 " bytes)",
                      SPC58_BOOT_FLASH_BASE, (uint64_t)raw);
-    } else {
-        error_report("spc58e: ELF loaded low=0x%" PRIx64 " high=0x%" PRIx64,
-                     low, high);
     }
 
     env->nip = entry;
@@ -889,23 +967,44 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e_map_memories();
     spc58e_load_firmware(machine, env);
 
-    error_report("spc58e: flash @0x%08x size=0x%x", SPC58_BOOT_FLASH_BASE, SPC58_BOOT_FLASH_SIZE);
-    error_report("spc58e: sys   @0x%08x size=0x%x", SPC58_SYS_SRAM_BASE, SPC58_SYS_SRAM_SIZE);
-    error_report("spc58e: c2ram @0x%08x size=0x%x", SPC58_CORE2_SRAM_BASE, SPC58_CORE2_SRAM_SIZE);
-    error_report("spc58e: intc  @0x%08x size=0x%x", SPC58_INTC_BASE, SPC58_INTC_SIZE);
-    error_report("spc58e: cgm   @0x%08x size=0x%x", SPC58_MC_CGM_BASE, SPC58_MC_CGM_SIZE);
-    error_report("spc58e: flash @0x%08x size=0x%x", SPC58_FLASHC_BASE, SPC58_FLASHC_SIZE);
-    error_report("spc58e: pit   @0x%08x size=0x%x", SPC58_PIT_BASE, SPC58_PIT_SIZE);
-    error_report("spc58e: stm   @0x%08x size=0x%x", SPC58_STM_BASE, SPC58_STM_SIZE);
-    error_report("spc58e: valid @0x%08x size=0x%x", SPC58_VALID_BASE, SPC58_VALID_SIZE);
-    error_report("spc58e: swt   @0x%08x size=0x%x", SPC58_SWT_BASE, SPC58_SWT_SIZE);
+    /*
+     * Pre-populate TLB1[0] to cover the boot flash region.
+     *
+     * QEMU's BOOKE206 debug accessor (ppc_cpu_get_phys_page_debug) walks
+     * the software TLB — it has no real-mode bypass.  Without at least one
+     * valid TLB entry GDB cannot read memory before the firmware sets up
+     * its own TLB entries.
+     *
+     * Entry: 0xfc0000-0xffffff, 256 KiB, supervisor R+X, not cached.
+     */
+    {
+        ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 1, SPC58_BOOT_FLASH_BASE, 0);
+        if (tlb) {
+            /* MAS1: valid, TID=0, TS=0, TSIZE=256KiB (tsize encoding = 9) */
+            tlb->mas1 = MAS1_VALID | (9u << MAS1_TSIZE_SHIFT);
+            /* MAS2: EPN = flash base, cache-inhibited + guarded */
+            tlb->mas2 = (SPC58_BOOT_FLASH_BASE & MAS2_EPN_MASK) | 0x18u;
+            /* MAS7:MAS3: RPN = flash base, supervisor R+X */
+            tlb->mas7_3 = (SPC58_BOOT_FLASH_BASE & MAS3_RPN_MASK)
+                          | MAS3_SR | MAS3_SX;
+        }
+    }
+
+    error_report("spc58e: flash @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_BOOT_FLASH_BASE, (uint64_t)SPC58_BOOT_FLASH_SIZE);
+    error_report("spc58e: sys   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_SYS_SRAM_BASE, (uint64_t)SPC58_SYS_SRAM_SIZE);
+    error_report("spc58e: c2ram @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_CORE2_SRAM_BASE, (uint64_t)SPC58_CORE2_SRAM_SIZE);
+    error_report("spc58e: intc  @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_INTC_BASE, (uint64_t)SPC58_INTC_SIZE);
+    error_report("spc58e: cgm   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_MC_CGM_BASE, (uint64_t)SPC58_MC_CGM_SIZE);
+    error_report("spc58e: flash @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_FLASHC_BASE, (uint64_t)SPC58_FLASHC_SIZE);
+    error_report("spc58e: pit   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_PIT_BASE, (uint64_t)SPC58_PIT_SIZE);
+    error_report("spc58e: stm   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_STM_BASE, (uint64_t)SPC58_STM_SIZE);
+    error_report("spc58e: valid @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_VALID_BASE, (uint64_t)SPC58_VALID_SIZE);
+    error_report("spc58e: swt   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_SWT_BASE, (uint64_t)SPC58_SWT_SIZE);
     error_report("spc58e: clock core=%uHz periph=%uHz", spc58e.cgm_core_hz, spc58e.cgm_periph_hz);
 }
 
-static void spc58e_machine_class_init(ObjectClass *oc, void *data)
+static void spc58e_machine_class_init(MachineClass *mc)
 {
-    MachineClass *mc = MACHINE_CLASS(oc);
-
     mc->desc = "SPC58E bring-up machine";
     mc->init = spc58e_machine_init;
     mc->max_cpus = 1;
