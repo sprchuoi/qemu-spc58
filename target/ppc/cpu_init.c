@@ -2770,7 +2770,7 @@ POWERPC_FAMILY(e200)(ObjectClass *oc, void *data)
     pcc->bfd_mach = bfd_mach_ppc_860;
     pcc->flags = POWERPC_FLAG_SPE | POWERPC_FLAG_CE |
                  POWERPC_FLAG_UBLE | POWERPC_FLAG_DE |
-                 POWERPC_FLAG_BUS_CLK;
+                 POWERPC_FLAG_BUS_CLK | POWERPC_FLAG_VLE;
 }
 
 enum fsl_e500_version {

@@ -772,6 +772,8 @@ enum {
     POWERPC_FLAG_SMT      = 0x00400000,
     /* Using "LPAR per core" mode  (as opposed to per-thread)                */
     POWERPC_FLAG_SMT_1LPAR = 0x00800000,
+    /* CPU uses VLE (Variable Length Encoding) ISA                           */
+    POWERPC_FLAG_VLE      = 0x01000000,
 };
 
 /*
@@ -789,6 +791,7 @@ enum {
     HFLAGS_DR = 4,   /* MSR_DR */
     HFLAGS_HR = 5,   /* computed from SPR_LPCR[HR] */
     HFLAGS_SPE = 6,  /* from MSR_SPE if cpu has SPE; avoid overlap w/ MSR_VR */
+    HFLAGS_VLE = 7,  /* cpu has VLE ISA enabled */
     HFLAGS_TM = 8,   /* computed from MSR_TM */
     HFLAGS_BE = 9,   /* MSR_BE -- from elsewhere on embedded ppc */
     HFLAGS_SE = 10,  /* MSR_SE -- from elsewhere on embedded ppc */

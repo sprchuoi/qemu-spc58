@@ -12,6 +12,7 @@
 #include "exec/address-spaces.h"
 #include "exec/memory.h"
 #include "exec/cpu-common.h"
+#include "sysemu/reset.h"
 #include "qemu/timer.h"
 #include "elf.h"
 #include "qapi/error.h"
@@ -38,6 +39,47 @@
 
 #define SPC58_INTC_NUM_IRQS    256u
 #define SPC58_INTC_VEC_BASE    0x1000u
+
+#define SPC58_MC_RGM_BASE      0xf7fa8000u
+#define SPC58_MC_RGM_SIZE      0x1000u
+
+#define SPC58_MC_RGM_DES       0x0000u
+#define SPC58_MC_RGM_FES       0x0300u
+#define SPC58_MC_RGM_PRST_BASE 0x0610u
+#define SPC58_MC_RGM_PSTAT_BASE 0x0630u
+#define SPC58_MC_RGM_RST_STRIDE 0x0004u
+#define SPC58_MC_RGM_RST_COUNT 8u
+
+#define SPC58_MC_ME_BASE       0xf7fb8000u
+#define SPC58_MC_ME_SIZE       0x1000u
+
+#define SPC58_MC_ME_GS         0x0000u
+#define SPC58_MC_ME_MCTL       0x0004u
+#define SPC58_MC_ME_ME         0x0008u
+#define SPC58_MC_ME_DMTS       0x0018u
+#define SPC58_MC_ME_DRUN_MC    0x002cu
+#define SPC58_MC_ME_RUN_MC_BASE 0x0030u
+#define SPC58_MC_ME_RUN_MC_STRIDE 0x0004u
+#define SPC58_MC_ME_HALT0_MC   0x0040u
+#define SPC58_MC_ME_STOP0_MC   0x0048u
+#define SPC58_MC_ME_RUN_PC_BASE 0x0080u
+#define SPC58_MC_ME_RUN_PC_STRIDE 0x0004u
+
+#define SPC58_MC_ME_KEY1       0x00005af0u
+#define SPC58_MC_ME_KEY2       0x0000a50fu
+#define SPC58_MC_ME_GS_MODE_SHIFT 28u
+#define SPC58_MC_ME_GS_MTRANS  0x08000000u
+
+#define SPC58_CLOCK_PAGE_BASE   0xf7fb0000u
+
+#define SPC58_PLL_DIG_BASE      0xf7fb0100u
+#define SPC58_PLL_DIG_SIZE      0x100u
+
+#define SPC58_XOSC_BASE         0xf7fb0200u
+#define SPC58_XOSC_SIZE         0x100u
+
+#define SPC58_MC_CGM_HONDA_BASE 0xf7fb0600u
+#define SPC58_MC_CGM_HONDA_SIZE 0x1000u
 
 #define SPC58_MC_CGM_BASE      0xfffec000u
 #define SPC58_MC_CGM_SIZE      0x4000u
@@ -104,18 +146,30 @@
 
 typedef struct SPC58EState {
     PowerPCCPU *cpu;
+    uint64_t firmware_entry;
     MemoryRegion boot_flash;
     MemoryRegion sys_sram;
     MemoryRegion core2_sram;
+    MemoryRegion core2_sram_alias;
     MemoryRegion intc_mmio;
+    MemoryRegion mc_rgm_mmio;
+    MemoryRegion mc_me_mmio;
+    MemoryRegion pll_dig_mmio;
+    MemoryRegion xosc_mmio;
     MemoryRegion mc_cgm_mmio;
+    MemoryRegion mc_cgm_honda_alias;
     MemoryRegion flashc_mmio;
     MemoryRegion pit_mmio;
     MemoryRegion stm_mmio;
     MemoryRegion valid_mmio;
     MemoryRegion swt_mmio;
+    MemoryRegion swt2_mmio_alias;
     uint32_t intc_regs[SPC58_INTC_SIZE / sizeof(uint32_t)];
     uint32_t intc_pending[SPC58_INTC_NUM_IRQS / 32u];
+    uint32_t mc_rgm_regs[SPC58_MC_RGM_SIZE / sizeof(uint32_t)];
+    uint32_t mc_me_regs[SPC58_MC_ME_SIZE / sizeof(uint32_t)];
+    uint32_t pll_dig_regs[SPC58_PLL_DIG_SIZE / sizeof(uint32_t)];
+    uint32_t xosc_regs[SPC58_XOSC_SIZE / sizeof(uint32_t)];
     uint32_t mc_cgm_regs[SPC58_MC_CGM_SIZE / sizeof(uint32_t)];
     uint32_t flashc_regs[SPC58_FLASHC_SIZE / sizeof(uint32_t)];
     uint32_t pit_regs[SPC58_PIT_SIZE / sizeof(uint32_t)];
@@ -124,6 +178,8 @@ typedef struct SPC58EState {
     uint32_t swt_regs[SPC58_SWT_SIZE / sizeof(uint32_t)];
     uint8_t intc_enabled;
     int32_t intc_current_irq;
+    uint8_t mc_me_pending_valid;
+    uint8_t mc_me_pending_mode;
     uint8_t cgm_enabled;
     uint32_t cgm_core_hz;
     uint32_t cgm_periph_hz;
@@ -141,6 +197,172 @@ static SPC58EState spc58e;
 
 static void spc58e_intc_set_pending(SPC58EState *s, uint32_t irq);
 static void spc58e_intc_recompute_irq(SPC58EState *s);
+
+static void spc58e_reset_mode_blocks(SPC58EState *s)
+{
+    memset(s->mc_rgm_regs, 0, sizeof(s->mc_rgm_regs));
+    memset(s->mc_me_regs, 0, sizeof(s->mc_me_regs));
+    memset(s->pll_dig_regs, 0, sizeof(s->pll_dig_regs));
+    memset(s->xosc_regs, 0, sizeof(s->xosc_regs));
+    s->mc_me_pending_valid = 0;
+    s->mc_me_pending_mode = 0;
+}
+
+static void spc58e_populate_boot_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, SPC58_BOOT_FLASH_BASE, 0);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate boot TLB entry");
+        return;
+    }
+
+    /* MAS1: valid, TID=0, TS=0, TSIZE=256KiB (tsize encoding = 8) */
+    tlb->mas1 = MAS1_VALID | (8u << MAS1_TSIZE_SHIFT);
+    /* MAS2: EPN = flash base, VLE + cache-inhibited + guarded */
+    tlb->mas2 = (SPC58_BOOT_FLASH_BASE & MAS2_EPN_MASK) |
+                MAS2_VLE | MAS2_I | MAS2_G;
+    /* MAS7:MAS3: RPN = flash base, supervisor R/W/X */
+    tlb->mas7_3 = (SPC58_BOOT_FLASH_BASE & MAS3_RPN_MASK)
+                  | MAS3_SR | MAS3_SW | MAS3_SX;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_core2_dmem_tlb(CPUPPCState *env)
+{
+    for (uint32_t addr = 0x60000000u; addr < 0x60008000u; addr += 0x1000u) {
+        ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, addr, 1);
+
+        if (!tlb) {
+            error_report("spc58e: failed to allocate core2 DMEM TLB entry for 0x%08x",
+                         addr);
+            return;
+        }
+
+        tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+        tlb->mas2 = addr & MAS2_EPN_MASK;
+        tlb->mas7_3 = (addr & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+    }
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_swt2_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, 0xf4058000u, 2);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate SWT2 TLB entry");
+        return;
+    }
+
+    tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+    tlb->mas2 = (0xf4058000u & MAS2_EPN_MASK) | MAS2_I | MAS2_G;
+    tlb->mas7_3 = (0xf4058000u & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_mc_rgm_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, SPC58_MC_RGM_BASE, 0);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate MC_RGM TLB entry");
+        return;
+    }
+
+    tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+    tlb->mas2 = (SPC58_MC_RGM_BASE & MAS2_EPN_MASK) | MAS2_I | MAS2_G;
+    tlb->mas7_3 = (SPC58_MC_RGM_BASE & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_mc_me_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, SPC58_MC_ME_BASE, 1);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate MC_ME TLB entry");
+        return;
+    }
+
+    tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+    tlb->mas2 = (SPC58_MC_ME_BASE & MAS2_EPN_MASK) | MAS2_I | MAS2_G;
+    tlb->mas7_3 = (SPC58_MC_ME_BASE & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_clock_page_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, SPC58_CLOCK_PAGE_BASE, 2);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate clock-page TLB entry");
+        return;
+    }
+
+    tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+    tlb->mas2 = (SPC58_CLOCK_PAGE_BASE & MAS2_EPN_MASK) | MAS2_I | MAS2_G;
+    tlb->mas7_3 = (SPC58_CLOCK_PAGE_BASE & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_populate_sysram_tlb(CPUPPCState *env)
+{
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 0, 0x400aa000u, 3);
+
+    if (!tlb) {
+        error_report("spc58e: failed to allocate system RAM TLB entry");
+        return;
+    }
+
+    tlb->mas1 = MAS1_VALID | (2u << MAS1_TSIZE_SHIFT);
+    tlb->mas2 = 0x400aa000u & MAS2_EPN_MASK;
+    tlb->mas7_3 = (0x400aa000u & MAS3_RPN_MASK) | MAS3_SR | MAS3_SW;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
+}
+
+static void spc58e_configure_tlb(CPUPPCState *env)
+{
+    env->spr[SPR_BOOKE_TLB0CFG] =
+        (4u << TLBnCFG_ASSOC_SHIFT) |
+        (1u << TLBnCFG_MINSIZE_SHIFT) |
+        (8u << TLBnCFG_MAXSIZE_SHIFT) |
+        TLBnCFG_AVAIL | TLBnCFG_IPROT | 64u;
+}
+
+static void spc58e_cpu_reset(void *opaque)
+{
+    PowerPCCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+    CPUPPCState *env = &cpu->env;
+
+    spc58e_reset_mode_blocks(&spc58e);
+    env->hreset_vector = spc58e.firmware_entry;
+    cpu_reset(cs);
+    cs->halted = 0;
+    spc58e_configure_tlb(env);
+    spc58e_populate_boot_tlb(env);
+    spc58e_populate_core2_dmem_tlb(env);
+    spc58e_populate_mc_rgm_tlb(env);
+    spc58e_populate_mc_me_tlb(env);
+    spc58e_populate_clock_page_tlb(env);
+    spc58e_populate_swt2_tlb(env);
+    spc58e_populate_sysram_tlb(env);
+}
 
 static void spc58e_swt_update_counter(SPC58EState *s)
 {
@@ -422,6 +644,203 @@ static void spc58e_intc_write(void *opaque, hwaddr addr, uint64_t data,
 static const MemoryRegionOps spc58e_intc_ops = {
     .read = spc58e_intc_read,
     .write = spc58e_intc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t spc58e_mc_rgm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->mc_rgm_regs)) ? s->mc_rgm_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_rgm rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_mc_rgm_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    if (addr == SPC58_MC_RGM_DES || addr == SPC58_MC_RGM_FES) {
+        if (idx < ARRAY_SIZE(s->mc_rgm_regs)) {
+            s->mc_rgm_regs[idx] &= ~value;
+        }
+    } else if (addr >= SPC58_MC_RGM_PRST_BASE &&
+               addr < SPC58_MC_RGM_PRST_BASE +
+                      SPC58_MC_RGM_RST_COUNT * SPC58_MC_RGM_RST_STRIDE) {
+        uint32_t rst_idx = (addr - SPC58_MC_RGM_PRST_BASE) / SPC58_MC_RGM_RST_STRIDE;
+        uint32_t pstat_addr = SPC58_MC_RGM_PSTAT_BASE +
+                              rst_idx * SPC58_MC_RGM_RST_STRIDE;
+        uint32_t pstat_idx = pstat_addr >> 2;
+
+        if (idx < ARRAY_SIZE(s->mc_rgm_regs)) {
+            s->mc_rgm_regs[idx] = value;
+        }
+        if (pstat_idx < ARRAY_SIZE(s->mc_rgm_regs)) {
+            s->mc_rgm_regs[pstat_idx] = value;
+        }
+    } else if (idx < ARRAY_SIZE(s->mc_rgm_regs)) {
+        s->mc_rgm_regs[idx] = value;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_rgm wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_mc_rgm_ops = {
+    .read = spc58e_mc_rgm_read,
+    .write = spc58e_mc_rgm_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void spc58e_mc_me_complete_transition(SPC58EState *s, uint32_t target_mode)
+{
+    uint32_t gs = s->mc_me_regs[SPC58_MC_ME_GS >> 2];
+
+    gs &= ~(0xfu << SPC58_MC_ME_GS_MODE_SHIFT);
+    gs &= ~SPC58_MC_ME_GS_MTRANS;
+    gs |= (target_mode & 0xfu) << SPC58_MC_ME_GS_MODE_SHIFT;
+    s->mc_me_regs[SPC58_MC_ME_GS >> 2] = gs;
+}
+
+static uint64_t spc58e_mc_me_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->mc_me_regs)) ? s->mc_me_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_me rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_mc_me_write(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (uint32_t)data;
+
+    if (idx < ARRAY_SIZE(s->mc_me_regs)) {
+        s->mc_me_regs[idx] = value;
+    }
+
+    if (addr == SPC58_MC_ME_MCTL) {
+        uint32_t key = value & 0xffffu;
+        uint32_t target_mode = (value >> SPC58_MC_ME_GS_MODE_SHIFT) & 0xfu;
+
+        if (key == SPC58_MC_ME_KEY1) {
+            s->mc_me_pending_valid = 1;
+            s->mc_me_pending_mode = target_mode;
+            s->mc_me_regs[SPC58_MC_ME_GS >> 2] |= SPC58_MC_ME_GS_MTRANS;
+        } else if (key == SPC58_MC_ME_KEY2 &&
+                   s->mc_me_pending_valid &&
+                   s->mc_me_pending_mode == target_mode) {
+            s->mc_me_pending_valid = 0;
+            spc58e_mc_me_complete_transition(s, target_mode);
+        } else {
+            s->mc_me_pending_valid = 0;
+            s->mc_me_regs[SPC58_MC_ME_GS >> 2] &= ~SPC58_MC_ME_GS_MTRANS;
+        }
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:mc_me wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_mc_me_ops = {
+    .read = spc58e_mc_me_read,
+    .write = spc58e_mc_me_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t spc58e_pll_dig_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->pll_dig_regs)) ? s->pll_dig_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:pll_dig rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_pll_dig_write(void *opaque, hwaddr addr, uint64_t data,
+                                 unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+
+    if (idx < ARRAY_SIZE(s->pll_dig_regs)) {
+        s->pll_dig_regs[idx] = (uint32_t)data;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:pll_dig wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_pll_dig_ops = {
+    .read = spc58e_pll_dig_read,
+    .write = spc58e_pll_dig_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t spc58e_xosc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+    uint32_t value = (idx < ARRAY_SIZE(s->xosc_regs)) ? s->xosc_regs[idx] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:xosc rd addr=0x%08" HWADDR_PRIx " size=%u -> 0x%08x\n",
+                  addr, size, value);
+    return value;
+}
+
+static void spc58e_xosc_write(void *opaque, hwaddr addr, uint64_t data,
+                              unsigned size)
+{
+    SPC58EState *s = opaque;
+    uint32_t idx = addr >> 2;
+
+    if (idx < ARRAY_SIZE(s->xosc_regs)) {
+        s->xosc_regs[idx] = (uint32_t)data;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "spc58e:xosc wr addr=0x%08" HWADDR_PRIx " size=%u val=0x%08" PRIx64 "\n",
+                  addr, size, data);
+}
+
+static const MemoryRegionOps spc58e_xosc_ops = {
+    .read = spc58e_xosc_read,
+    .write = spc58e_xosc_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
@@ -874,13 +1293,40 @@ static void spc58e_map_memories(void)
                            SPC58_CORE2_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, SPC58_CORE2_SRAM_BASE, &spc58e.core2_sram);
 
+    memory_region_init_alias(&spc58e.core2_sram_alias, NULL,
+                             "spc58e.core2_sram_alias", &spc58e.core2_sram,
+                             0, SPC58_CORE2_SRAM_SIZE);
+    memory_region_add_subregion(sysmem, 0x60000000u, &spc58e.core2_sram_alias);
+
     memory_region_init_io(&spc58e.intc_mmio, NULL, &spc58e_intc_ops, &spc58e,
                           "spc58e.intc", SPC58_INTC_SIZE);
     memory_region_add_subregion(sysmem, SPC58_INTC_BASE, &spc58e.intc_mmio);
 
+    memory_region_init_io(&spc58e.mc_rgm_mmio, NULL, &spc58e_mc_rgm_ops, &spc58e,
+                          "spc58e.mc_rgm", SPC58_MC_RGM_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_MC_RGM_BASE, &spc58e.mc_rgm_mmio);
+
+    memory_region_init_io(&spc58e.mc_me_mmio, NULL, &spc58e_mc_me_ops, &spc58e,
+                          "spc58e.mc_me", SPC58_MC_ME_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_MC_ME_BASE, &spc58e.mc_me_mmio);
+
+    memory_region_init_io(&spc58e.pll_dig_mmio, NULL, &spc58e_pll_dig_ops, &spc58e,
+                          "spc58e.pll_dig", SPC58_PLL_DIG_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_PLL_DIG_BASE, &spc58e.pll_dig_mmio);
+
+    memory_region_init_io(&spc58e.xosc_mmio, NULL, &spc58e_xosc_ops, &spc58e,
+                          "spc58e.xosc", SPC58_XOSC_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_XOSC_BASE, &spc58e.xosc_mmio);
+
     memory_region_init_io(&spc58e.mc_cgm_mmio, NULL, &spc58e_mc_cgm_ops, &spc58e,
                           "spc58e.mc_cgm", SPC58_MC_CGM_SIZE);
     memory_region_add_subregion(sysmem, SPC58_MC_CGM_BASE, &spc58e.mc_cgm_mmio);
+
+    memory_region_init_alias(&spc58e.mc_cgm_honda_alias, NULL,
+                             "spc58e.mc_cgm_honda_alias", &spc58e.mc_cgm_mmio,
+                             0, SPC58_MC_CGM_HONDA_SIZE);
+    memory_region_add_subregion(sysmem, SPC58_MC_CGM_HONDA_BASE,
+                                &spc58e.mc_cgm_honda_alias);
 
     memory_region_init_io(&spc58e.flashc_mmio, NULL, &spc58e_flashc_ops, &spc58e,
                           "spc58e.flashc", SPC58_FLASHC_SIZE);
@@ -901,6 +1347,11 @@ static void spc58e_map_memories(void)
     memory_region_init_io(&spc58e.swt_mmio, NULL, &spc58e_swt_ops, &spc58e,
                           "spc58e.swt", SPC58_SWT_SIZE);
     memory_region_add_subregion(sysmem, SPC58_SWT_BASE, &spc58e.swt_mmio);
+
+    memory_region_init_alias(&spc58e.swt2_mmio_alias, NULL,
+                             "spc58e.swt2_alias", &spc58e.swt_mmio,
+                             0, SPC58_SWT_SIZE);
+    memory_region_add_subregion(sysmem, 0xf4058000u, &spc58e.swt2_mmio_alias);
 }
 
 static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
@@ -931,6 +1382,8 @@ static void spc58e_load_firmware(MachineState *machine, CPUPPCState *env)
                      SPC58_BOOT_FLASH_BASE, (uint64_t)raw);
     }
 
+    spc58e.firmware_entry = entry;
+    env->hreset_vector = entry;
     env->nip = entry;
     error_report("spc58e: entry=0x%" PRIx64, entry);
     spc58e.valid_regs[SPC58_VALID_ENTRY_LO >> 2] = (uint32_t)entry;
@@ -946,6 +1399,7 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e.cpu = cpu;
     spc58e.intc_enabled = 1;
     spc58e.intc_current_irq = -1;
+    spc58e_reset_mode_blocks(&spc58e);
     spc58e.cgm_enabled = 1;
     spc58e.mc_cgm_regs[SPC58_MC_CGM_DIV >> 2] = 1;
     spc58e_cgm_recompute_clocks(&spc58e);
@@ -967,33 +1421,15 @@ static void spc58e_machine_init(MachineState *machine)
     spc58e_map_memories();
     spc58e_load_firmware(machine, env);
 
-    /*
-     * Pre-populate TLB1[0] to cover the boot flash region.
-     *
-     * QEMU's BOOKE206 debug accessor (ppc_cpu_get_phys_page_debug) walks
-     * the software TLB — it has no real-mode bypass.  Without at least one
-     * valid TLB entry GDB cannot read memory before the firmware sets up
-     * its own TLB entries.
-     *
-     * Entry: 0xfc0000-0xffffff, 256 KiB, supervisor R+X, not cached.
-     */
-    {
-        ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 1, SPC58_BOOT_FLASH_BASE, 0);
-        if (tlb) {
-            /* MAS1: valid, TID=0, TS=0, TSIZE=256KiB (tsize encoding = 9) */
-            tlb->mas1 = MAS1_VALID | (9u << MAS1_TSIZE_SHIFT);
-            /* MAS2: EPN = flash base, cache-inhibited + guarded */
-            tlb->mas2 = (SPC58_BOOT_FLASH_BASE & MAS2_EPN_MASK) | 0x18u;
-            /* MAS7:MAS3: RPN = flash base, supervisor R+X */
-            tlb->mas7_3 = (SPC58_BOOT_FLASH_BASE & MAS3_RPN_MASK)
-                          | MAS3_SR | MAS3_SX;
-        }
-    }
+    qemu_register_reset(spc58e_cpu_reset, cpu);
+    spc58e_cpu_reset(cpu);
 
     error_report("spc58e: flash @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_BOOT_FLASH_BASE, (uint64_t)SPC58_BOOT_FLASH_SIZE);
     error_report("spc58e: sys   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_SYS_SRAM_BASE, (uint64_t)SPC58_SYS_SRAM_SIZE);
     error_report("spc58e: c2ram @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_CORE2_SRAM_BASE, (uint64_t)SPC58_CORE2_SRAM_SIZE);
     error_report("spc58e: intc  @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_INTC_BASE, (uint64_t)SPC58_INTC_SIZE);
+    error_report("spc58e: mcrgm @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_MC_RGM_BASE, (uint64_t)SPC58_MC_RGM_SIZE);
+    error_report("spc58e: mc_me @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_MC_ME_BASE, (uint64_t)SPC58_MC_ME_SIZE);
     error_report("spc58e: cgm   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_MC_CGM_BASE, (uint64_t)SPC58_MC_CGM_SIZE);
     error_report("spc58e: flash @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_FLASHC_BASE, (uint64_t)SPC58_FLASHC_SIZE);
     error_report("spc58e: pit   @0x%08"PRIx64" size=0x%"PRIx64, (uint64_t)SPC58_PIT_BASE, (uint64_t)SPC58_PIT_SIZE);

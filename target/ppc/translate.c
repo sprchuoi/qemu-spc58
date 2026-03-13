@@ -194,6 +194,7 @@ struct DisasContext {
     bool mmcr0_pmcjce;
     bool pmc_other;
     bool pmu_insn_cnt;
+    bool vle_enabled;
     ppc_spr_t *spr_cb; /* Needed to check rights for mfspr/mtspr */
     int singlestep_enabled;
     uint32_t flags;
@@ -4227,16 +4228,20 @@ static void gen_lookup_and_goto_ptr(DisasContext *ctx)
 /***                                Branch                                 ***/
 static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
 {
+    target_ulong align_mask = ctx->vle_enabled ? (target_ulong)~1ull
+                                               : (target_ulong)~3ull;
+
     if (NARROW_MODE(ctx)) {
         dest = (uint32_t) dest;
+        align_mask = (uint32_t)align_mask;
     }
     if (use_goto_tb(ctx, dest)) {
         pmu_count_insns(ctx);
         tcg_gen_goto_tb(n);
-        tcg_gen_movi_tl(cpu_nip, dest & ~3);
+        tcg_gen_movi_tl(cpu_nip, dest & align_mask);
         tcg_gen_exit_tb(ctx->base.tb, n);
     } else {
-        tcg_gen_movi_tl(cpu_nip, dest & ~3);
+        tcg_gen_movi_tl(cpu_nip, dest & align_mask);
         gen_lookup_and_goto_ptr(ctx);
     }
 }
@@ -6420,6 +6425,8 @@ static bool resolve_PLS_D(DisasContext *ctx, arg_D *d, arg_PLS_D *a)
 
 #include "translate/storage-ctrl-impl.c.inc"
 
+#include "translate/vle-impl.c.inc"
+
 /* Handles lfdp */
 static void gen_dform39(DisasContext *ctx)
 {
@@ -7354,6 +7361,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->mmcr0_pmcjce = (hflags >> HFLAGS_PMCJCE) & 1;
     ctx->pmc_other = (hflags >> HFLAGS_PMC_OTHER) & 1;
     ctx->pmu_insn_cnt = (hflags >> HFLAGS_INSN_CNT) & 1;
+    ctx->vle_enabled = (hflags >> HFLAGS_VLE) & 1;
 
     ctx->singlestep_enabled = 0;
     if ((hflags >> HFLAGS_SE) & 1) {
@@ -7394,6 +7402,15 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
 
     ctx->cia = pc = ctx->base.pc_next;
+
+    if (ctx->vle_enabled) {
+        ok = ppc_vle_translate_insn(ctx, env, cpu);
+        if (!ok) {
+            gen_invalid(ctx);
+        }
+        return;
+    }
+
     insn = translator_ldl_swap(env, dcbase, pc, need_byteswap(ctx));
     ctx->base.pc_next = pc += 4;
 

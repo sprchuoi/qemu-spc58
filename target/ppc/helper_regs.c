@@ -129,6 +129,9 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
     if ((ppc_flags & POWERPC_FLAG_SPE) && (msr & (1 << MSR_SPE))) {
         hflags |= 1 << HFLAGS_SPE;
     }
+    if (ppc_flags & POWERPC_FLAG_VLE) {
+        hflags |= 1 << HFLAGS_VLE;
+    }
     if (ppc_flags & POWERPC_FLAG_VRE) {
         QEMU_BUILD_BUG_ON(MSR_VR != HFLAGS_VR);
         msr_mask |= 1 << MSR_VR;
